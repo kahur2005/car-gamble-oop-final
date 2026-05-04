@@ -1,32 +1,27 @@
-/*
- * vehicle.java — Vehicle Detection Gambling Game (Swing GUI)
- *
- * The detection panel replicates the OpenCV visuals from vehicle.py:
- *   green bounding boxes, red center dots, orange counting line.
- *
- * HOW TO ENABLE REAL OPENCV (optional):
- *   1. Download OpenCV for Windows: https://opencv.org/releases/
- *   2. Compile:
- *        javac -cp ".;C:\opencv\build\java\opencv-4120.jar" vehicle.java
- *   3. Run:
- *        java -cp ".;C:\opencv\build\java\opencv-4120.jar" ^ -Djava.library.path="C:\opencv\build\java\x64" vehicle
- *   Without OpenCV the app runs in animated-simulation mode (default).
- *
- * Compile & run (no OpenCV needed):
- *   javac vehicle.java
- *   java  vehicle
- */
-
 import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.BufferedInputStream;
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.io.File;
+import java.io.InputStreamReader;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.imageio.ImageIO;
 import javax.swing.*;
 import javax.swing.border.*;
 
-// ── Vehicle sprite ────────────────────────────────────────────────────────────
-// Represents one vehicle moving through the detection scene
+// Common base for SimulatedVideoProcessor and OpenCVVideoProcessor.
+// GameWindow holds an AbstractVideoProcessor reference so it works with either.
+abstract class AbstractVideoProcessor extends Thread {
+    public AbstractVideoProcessor() { setDaemon(true); }
+    public abstract int  getVehicleCount();
+    public abstract void stopProcessing();
+}
+
 class VehicleSprite {
 
     private double x;
@@ -70,43 +65,37 @@ class VehicleSprite {
     public int getWidth()           { return w; }
     public int getHeight()          { return h; }
 
-    // Draw car body, windows, wheels, then the OpenCV-style overlay
+    // Draws car body + OpenCV-style overlay (green box, yellow label, red dot)
     public void draw(Graphics2D g2, int vehicleCount) {
         int ix = (int) x;
 
-        // Car body
         g2.setColor(bodyColor);
         g2.fillRoundRect(ix, y + h / 4, w, h * 3 / 4, 10, 10);
-
-        // Roof
         g2.fillRoundRect(ix + w / 8, y + 2, w * 3 / 4, h / 2 + 2, 8, 8);
 
-        // Windows
         g2.setColor(new Color(170, 225, 255, 190));
-        g2.fillRoundRect(ix + w / 5,     y + 5, w * 3 / 10, h * 2 / 5, 4, 4);
+        g2.fillRoundRect(ix + w / 5,      y + 5, w * 3 / 10, h * 2 / 5, 4, 4);
         g2.fillRoundRect(ix + w * 9 / 16, y + 5, w * 3 / 10, h * 2 / 5, 4, 4);
 
-        // Wheels
         g2.setColor(new Color(30, 30, 30));
         int wr = h / 5;
-        g2.fillOval(ix + w / 6  - wr, y + h * 3 / 4 - wr / 2, wr * 2, wr * 2);
-        g2.fillOval(ix + w * 5 / 6 - wr, y + h * 3 / 4 - wr / 2, wr * 2, wr * 2);
+        g2.fillOval(ix + w / 6       - wr, y + h * 3 / 4 - wr / 2, wr * 2, wr * 2);
+        g2.fillOval(ix + w * 5 / 6   - wr, y + h * 3 / 4 - wr / 2, wr * 2, wr * 2);
         g2.setColor(new Color(80, 80, 80));
-        g2.fillOval(ix + w / 6  - wr / 2, y + h * 3 / 4, wr, wr);
-        g2.fillOval(ix + w * 5 / 6 - wr / 2, y + h * 3 / 4, wr, wr);
+        g2.fillOval(ix + w / 6       - wr / 2, y + h * 3 / 4, wr, wr);
+        g2.fillOval(ix + w * 5 / 6   - wr / 2, y + h * 3 / 4, wr, wr);
 
-        // ── OpenCV-style overlay ──────────────────────────────────────────────
-        // Green bounding box (like cv2.rectangle with (0,255,0))
+        // Green bounding box (cv2.rectangle equivalent)
         g2.setColor(new Color(0, 255, 0));
         g2.setStroke(new BasicStroke(2));
         g2.drawRect(ix - 4, y - 4, w + 8, h + 8);
 
-        // "VEHICLE COUNTER: N" above bounding box (like cv2.putText)
+        // Yellow counter label (cv2.putText equivalent)
         g2.setColor(new Color(255, 244, 0));
         g2.setFont(new Font("Arial", Font.BOLD, 11));
         g2.drawString("VEHICLE COUNTER: " + vehicleCount, ix, y - 8);
 
-        // Red center dot (like cv2.circle with (0,0,255))
+        // Red center dot (cv2.circle equivalent)
         g2.setColor(new Color(255, 0, 0));
         g2.fillOval(getCenterX() - 4, getCenterY() - 4, 8, 8);
 
@@ -114,7 +103,6 @@ class VehicleSprite {
     }
 }
 
-// ── Player ────────────────────────────────────────────────────────────────────
 class Player {
     private final String name;
     private double balance;
@@ -135,14 +123,12 @@ class Player {
     public void lose(double bet) { balance -= bet; }
 }
 
-// ── VideoPanel ────────────────────────────────────────────────────────────────
-// Renders the animated detection scene (road, vehicles, counting line, HUD)
 class VideoPanel extends JPanel {
 
-    // Vertical counting line x-position (mirrors Python's horizontal line)
+    // Simulation mode — vertical counting line x-position
     static final int COUNT_LINE_X = 600;
 
-    // Four lane center Y positions
+    // Four lane centre Y positions
     static final int[] LANE_YS = { 165, 255, 345, 430 };
 
     private static final Color BG_TOP    = new Color(8,  12, 22);
@@ -150,15 +136,21 @@ class VideoPanel extends JPanel {
     private static final Color ROAD_CLR  = new Color(55, 58, 62);
     private static final Color KERB_CLR  = new Color(80, 82, 86);
     private static final Color LANE_CLR  = new Color(195, 185, 80, 110);
-    private static final Color LINE_NORM = new Color(255, 127, 0);   // orange
-    private static final Color LINE_HIT  = new Color(0,   127, 255); // blue flash
+    private static final Color LINE_NORM = new Color(255, 127, 0);
+    private static final Color LINE_HIT  = new Color(0,   127, 255);
     private static final Color HUD_TEXT  = new Color(0,   0,   255);
 
     private final List<VehicleSprite> vehicles = new CopyOnWriteArrayList<>();
-    private volatile int  vehicleCount = 0;
-    private volatile boolean lineFlash = false;
-    private long flashTime = 0;
-    private volatile boolean running = false;
+    private volatile int     vehicleCount = 0;
+    private volatile boolean lineFlash    = false;
+    private long             flashTime    = 0;
+    private volatile boolean running      = false;
+
+    // Python mode — status overlay text while subprocess is running
+    private volatile String pythonStatus = null;
+
+    // OpenCV video mode — set by OpenCVVideoProcessor each frame
+    private volatile BufferedImage videoFrame = null;
 
     public VideoPanel() {
         setBackground(BG_TOP);
@@ -174,9 +166,52 @@ class VideoPanel extends JPanel {
         flashTime = System.currentTimeMillis();
     }
 
+    // Called by OpenCVVideoProcessor to push a processed frame
+    public void setVideoFrame(BufferedImage frame) {
+        this.videoFrame = frame;
+        repaint();
+    }
+
+    // Called when starting a new round to clear the previous frame
+    public void clearVideoFrame() {
+        this.videoFrame = null;
+        repaint();
+    }
+
+    // Python mode overlay — shown while the Python subprocess is running
+    public void setPythonStatus(String msg) {
+        this.pythonStatus = msg;
+        repaint();
+    }
+
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
+
+        // ── Video frame mode (preview loop or OpenCV overlay) ─────────────────
+        if (videoFrame != null) {
+            int W = getWidth(), H = getHeight();
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                                RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g2.drawImage(videoFrame, 0, 0, W, H, null);
+
+            // While idle (no round running) show a hint bar at the bottom
+            if (!running) {
+                g2.setColor(new Color(0, 0, 0, 170));
+                g2.fillRect(0, H - 46, W, 46);
+                g2.setColor(new Color(220, 220, 235));
+                g2.setFont(new Font("Arial", Font.BOLD, 15));
+                String hint = "Enter your guess & bet on the right, then press START DETECTION";
+                FontMetrics fm = g2.getFontMetrics();
+                g2.drawString(hint, (W - fm.stringWidth(hint)) / 2, H - 16);
+            }
+
+            g2.dispose();
+            return;
+        }
+
+        // Simulation mode 
         Graphics2D g2 = (Graphics2D) g.create();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,    RenderingHints.VALUE_ANTIALIAS_ON);
         g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
@@ -193,7 +228,7 @@ class VideoPanel extends JPanel {
 
         // Kerb lines
         g2.setColor(KERB_CLR);
-        g2.fillRect(0, H / 5, W, 6);
+        g2.fillRect(0, H / 5,  W, 6);
         g2.fillRect(0, H - 30, W, 6);
 
         // Dashed lane markings
@@ -206,7 +241,7 @@ class VideoPanel extends JPanel {
         }
         g2.setStroke(new BasicStroke(1));
 
-        // Counting line (orange normally, blue flash on hit — mirrors cv2.line colours)
+        // Counting line (orange normally, blue flash on hit)
         boolean flash = lineFlash && (System.currentTimeMillis() - flashTime < 280);
         if (!flash) lineFlash = false;
         g2.setColor(flash ? LINE_HIT : LINE_NORM);
@@ -219,7 +254,7 @@ class VideoPanel extends JPanel {
             v.draw(g2, vehicleCount);
         }
 
-        // HUD — "VEHICLE COUNTER: N" (mirrors Python's cv2.putText in top-left)
+        // HUD counter
         if (running || vehicleCount > 0) {
             g2.setColor(new Color(0, 0, 0, 160));
             g2.fillRoundRect(12, 12, 290, 52, 10, 10);
@@ -228,7 +263,7 @@ class VideoPanel extends JPanel {
             g2.drawString("VEHICLE COUNTER: " + vehicleCount, 18, 50);
         }
 
-        // Placeholder when idle
+        // Idle hint
         if (!running && vehicleCount == 0) {
             g2.setColor(new Color(130, 130, 145));
             g2.setFont(new Font("Arial", Font.PLAIN, 15));
@@ -237,35 +272,44 @@ class VideoPanel extends JPanel {
             g2.drawString(hint, (W - fm.stringWidth(hint)) / 2, H / 2 + 6);
         }
 
+        // Python subprocess status banner
+        if (pythonStatus != null) {
+            g2.setFont(new Font("Arial", Font.BOLD, 14));
+            FontMetrics fm = g2.getFontMetrics();
+            int sw = fm.stringWidth(pythonStatus);
+            int bx = (W - sw) / 2 - 14, by = H * 2 / 3 - 22;
+            g2.setColor(new Color(0, 0, 0, 180));
+            g2.fillRoundRect(bx, by, sw + 28, 34, 10, 10);
+            g2.setColor(new Color(100, 220, 120));
+            g2.drawString(pythonStatus, bx + 14, by + 22);
+        }
+
         g2.dispose();
     }
 }
 
-// ── VideoProcessor ────────────────────────────────────────────────────────────
-// Background thread: spawns vehicles, moves them, detects line crossings
-class VideoProcessor extends Thread {
+class SimulatedVideoProcessor extends AbstractVideoProcessor {
 
-    private static final int DURATION_MS      = 14_000;
-    private static final int SPAWN_MIN_MS     = 550;
-    private static final int SPAWN_RAND_MS    = 500;
-    private static final int FRAME_DELAY_MS   = 16;       // ~60 fps
+    private static final int DURATION_MS    = 14_000;
+    private static final int SPAWN_MIN_MS   = 550;
+    private static final int SPAWN_RAND_MS  = 500;
+    private static final int FRAME_DELAY_MS = 16;
     private static final Random RNG = new Random();
 
     private final VideoPanel panel;
-    private final Runnable onCountUpdate;
-    private final Runnable onFinished;
+    private final Runnable   onCountUpdate;
+    private final Runnable   onFinished;
     private volatile int vehicleCount = 0;
     private final AtomicBoolean running = new AtomicBoolean(false);
 
-    public VideoProcessor(VideoPanel panel, Runnable onCountUpdate, Runnable onFinished) {
+    public SimulatedVideoProcessor(VideoPanel panel, Runnable onCountUpdate, Runnable onFinished) {
         this.panel         = panel;
         this.onCountUpdate = onCountUpdate;
         this.onFinished    = onFinished;
-        setDaemon(true);
     }
 
-    public int  getVehicleCount() { return vehicleCount; }
-    public void stopProcessing()  { running.set(false); }
+    @Override public int  getVehicleCount() { return vehicleCount; }
+    @Override public void stopProcessing()  { running.set(false); }
 
     @Override
     @SuppressWarnings("BusyWait")
@@ -275,22 +319,20 @@ class VideoProcessor extends Thread {
         panel.setCount(0);
         panel.setRunning(true);
 
-        long start     = System.currentTimeMillis();
-        long lastSpawn = 0;
+        long start         = System.currentTimeMillis();
+        long lastSpawn     = 0;
         long nextSpawnDelay = spawnDelay();
 
         while (running.get() && (System.currentTimeMillis() - start) < DURATION_MS) {
             long now = System.currentTimeMillis();
 
-            // Spawn a new vehicle on a random lane
             if (now - lastSpawn >= nextSpawnDelay) {
                 int lane = VideoPanel.LANE_YS[RNG.nextInt(VideoPanel.LANE_YS.length)];
                 panel.getVehicles().add(new VehicleSprite(lane));
-                lastSpawn     = now;
+                lastSpawn      = now;
                 nextSpawnDelay = spawnDelay();
             }
 
-            // Move vehicles and detect line crossings
             List<VehicleSprite> toRemove = new ArrayList<>();
             for (VehicleSprite v : panel.getVehicles()) {
                 v.move();
@@ -321,8 +363,172 @@ class VideoProcessor extends Thread {
     }
 }
 
-// ── GameWindow ────────────────────────────────────────────────────────────────
+// Spawns "python vehicle.py" as a subprocess, reads its stdout, and updates the
+// game with live crossing counts. When the video ends Python prints "FINAL:N"
+// which is used as the authoritative count for win/lose decisions.
+//
+// vehicle.py handles all detection (MOG background subtraction, contours, etc.)
+// exactly as the original Python script — Java only manages the subprocess I/O.
+class PythonVideoProcessor extends AbstractVideoProcessor {
+
+    private static final String SCRIPT  = "vehicle.py";
+    private static final String STATUS  = "Python detection running — watch the Python window";
+
+    private final VideoPanel    panel;
+    private final Runnable      onCountUpdate;
+    private final Runnable      onFinished;
+    private volatile int        vehicleCount = 0;
+    private final AtomicBoolean running      = new AtomicBoolean(false);
+    private Process             process;
+
+    public PythonVideoProcessor(VideoPanel panel, Runnable onCountUpdate, Runnable onFinished) {
+        this.panel         = panel;
+        this.onCountUpdate = onCountUpdate;
+        this.onFinished    = onFinished;
+    }
+
+    @Override public int  getVehicleCount() { return vehicleCount; }
+
+    @Override public void stopProcessing() {
+        running.set(false);
+        if (process != null) process.destroy();
+    }
+
+    @Override
+    public void run() {
+        running.set(true);
+        vehicleCount = 0;
+        panel.setCount(0);
+        panel.setRunning(true);
+        panel.setPythonStatus(STATUS);
+
+        try {
+            ProcessBuilder pb = new ProcessBuilder("python", SCRIPT);
+            pb.directory(new File("."));
+            pb.redirectErrorStream(false);   // keep stderr out of our count stream
+            process = pb.start();
+
+            BufferedReader out = new BufferedReader(
+                    new InputStreamReader(process.getInputStream()));
+
+            String line;
+            while ((line = out.readLine()) != null) {
+                line = line.trim();
+                if (line.startsWith("FINAL:")) {
+                    // Authoritative final count sent by vehicle.py at the very end
+                    try {
+                        vehicleCount = Integer.parseInt(line.substring(6));
+                        panel.setCount(vehicleCount);
+                        SwingUtilities.invokeLater(onCountUpdate);
+                    } catch (NumberFormatException ignored) {}
+                } else {
+                    // Live count printed each time a vehicle crosses the line
+                    try {
+                        vehicleCount = Integer.parseInt(line);
+                        panel.setCount(vehicleCount);
+                        panel.flashLine();
+                        SwingUtilities.invokeLater(onCountUpdate);
+                    } catch (NumberFormatException ignored) {}
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            System.err.println("[PythonVideoProcessor] " + e.getMessage());
+        }
+
+        panel.setRunning(false);
+        panel.setPythonStatus(null);
+        SwingUtilities.invokeLater(onFinished);
+    }
+}
+
+class VideoPreviewThread extends Thread {
+
+    // Inline Python: loop Video.mp4, encode each frame as JPEG, write to stdout
+    private static final String SCRIPT =
+        "import cv2,sys,struct,time\n" +
+        "cap=cv2.VideoCapture('Video.mp4')\n" +
+        "fps=cap.get(cv2.CAP_PROP_FPS)\n" +
+        "if fps<=0 or fps>120: fps=25\n" +
+        "delay=1.0/fps\n" +
+        "while True:\n" +
+        " ret,frame=cap.read()\n" +
+        " if not ret:\n" +
+        "  cap.set(cv2.CAP_PROP_POS_FRAMES,0)\n" +
+        "  continue\n" +
+        " ok,buf=cv2.imencode('.jpg',frame,[cv2.IMWRITE_JPEG_QUALITY,70])\n" +
+        " if ok:\n" +
+        "  data=buf.tobytes()\n" +
+        "  sys.stdout.buffer.write(struct.pack('>I',len(data))+data)\n" +
+        "  sys.stdout.buffer.flush()\n" +
+        " time.sleep(delay)\n";
+
+    private final VideoPanel panel;
+    private volatile boolean active = true;
+    private Process process;
+
+    public VideoPreviewThread(VideoPanel panel) {
+        this.panel = panel;
+        setDaemon(true);
+    }
+
+    public void stopPreview() {
+        active = false;
+        if (process != null) process.destroy();
+    }
+
+    @Override
+    public void run() {
+        try {
+            process = new ProcessBuilder("python", "-c", SCRIPT)
+                    .redirectErrorStream(false)
+                    .start();
+
+            DataInputStream dis = new DataInputStream(
+                    new BufferedInputStream(process.getInputStream(), 65536));
+
+            while (active) {
+                int size = dis.readInt();
+                if (size <= 0 || size > 10_000_000) break;
+                byte[] buf = new byte[size];
+                dis.readFully(buf);
+                BufferedImage img = ImageIO.read(new ByteArrayInputStream(buf));
+                if (img != null && active) panel.setVideoFrame(img);
+            }
+        } catch (Exception ignored) {
+            // Normal path when stopPreview() destroys the process
+        }
+    }
+}
+
 class GameWindow extends JFrame {
+
+    private static final boolean PYTHON_AVAILABLE;
+    static {
+        boolean avail = false;
+        try {
+            if (new File("vehicle.py").exists()) {
+                Process p = new ProcessBuilder("python", "--version")
+                        .redirectErrorStream(true).start();
+                avail = (p.waitFor() == 0);
+            }
+        } catch (Throwable ignored) { }
+        PYTHON_AVAILABLE = avail;
+    }
+
+    private static final boolean OPENCV_AVAILABLE;
+    static {
+        boolean avail = false;
+        try {
+            Class<?> core = Class.forName("org.opencv.core.Core");
+            String   lib  = (String) core.getField("NATIVE_LIBRARY_NAME").get(null);
+            System.loadLibrary(lib);
+            avail = true;
+        } catch (Throwable ignored) { }
+        OPENCV_AVAILABLE = avail;
+    }
 
     // Colour palette (dark theme)
     private static final Color BG_WINDOW = new Color(13,  13,  20);
@@ -337,18 +543,18 @@ class GameWindow extends JFrame {
     private static final Color BORDER    = new Color(55,  55,  78);
 
     private final Player player;
-    private VideoProcessor processor;
+    private AbstractVideoProcessor processor;
+    private VideoPreviewThread      previewThread;
     private VideoPanel videoPanel;
 
-    // Widgets
-    private JLabel balanceLabel;
-    private JLabel liveCountLabel;
+    private JLabel    balanceLabel;
+    private JLabel    liveCountLabel;
     private JTextField guessField;
     private JTextField betField;
-    private JButton startBtn;
-    private JButton playAgainBtn;
-    private JLabel resultTitle;
-    private JLabel resultDetail;
+    private JButton   startBtn;
+    private JButton   playAgainBtn;
+    private JLabel    resultTitle;
+    private JLabel    resultDetail;
 
     private int    pendingGuess;
     private double pendingBet;
@@ -356,9 +562,19 @@ class GameWindow extends JFrame {
     public GameWindow(Player player) {
         this.player = player;
         buildUI();
+        startPreview();
     }
 
-    // ── Build UI ──────────────────────────────────────────────────────────────
+    private void startPreview() {
+        if (!PYTHON_AVAILABLE) return;
+        previewThread = new VideoPreviewThread(videoPanel);
+        previewThread.start();
+    }
+
+    private void stopPreview() {
+        if (previewThread != null) { previewThread.stopPreview(); previewThread = null; }
+    }
+
 
     private void buildUI() {
         setTitle("Vehicle Detection Gambling Game");
@@ -375,15 +591,26 @@ class GameWindow extends JFrame {
     }
 
     private JPanel buildHeader() {
-        JPanel h = new JPanel(new BorderLayout());
+        JPanel h = new JPanel(new BorderLayout(14, 0));
         h.setBackground(new Color(18, 17, 30));
         h.setBorder(new EmptyBorder(13, 18, 13, 18));
 
         JLabel title = label("VEHICLE DETECTION GAMBLING", TEXT_PRI, Font.BOLD, 21);
-        balanceLabel  = label("Balance:  $" + fmt(player.getBalance()), ACCENT_G, Font.BOLD, 19);
 
-        h.add(title,        BorderLayout.WEST);
-        h.add(balanceLabel, BorderLayout.EAST);
+        // Mode badge — priority: Python > Simulation
+        String modeText  = PYTHON_AVAILABLE ? "Python OpenCV Mode" : "Simulation Mode";
+        Color  modeColor = PYTHON_AVAILABLE ? ACCENT_G : TEXT_SEC;
+        JLabel modeLabel = label("[" + modeText + "]", modeColor, Font.BOLD, 13);
+
+        balanceLabel = label("Balance:  $" + fmt(player.getBalance()), ACCENT_G, Font.BOLD, 19);
+
+        JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 14, 0));
+        right.setOpaque(false);
+        right.add(modeLabel);
+        right.add(balanceLabel);
+
+        h.add(title, BorderLayout.WEST);
+        h.add(right, BorderLayout.EAST);
         return h;
     }
 
@@ -395,7 +622,7 @@ class GameWindow extends JFrame {
         videoPanel = new VideoPanel();
         videoPanel.setBorder(BorderFactory.createLineBorder(BORDER, 1));
 
-        body.add(videoPanel,   BorderLayout.CENTER);
+        body.add(videoPanel,    BorderLayout.CENTER);
         body.add(buildSidebar(), BorderLayout.EAST);
         return body;
     }
@@ -440,10 +667,10 @@ class GameWindow extends JFrame {
         g.weightx = 1.0;
         g.insets  = new Insets(3, 0, 3, 0);
 
-        g.gridy = 0; c.add(label("Your guess  (number of vehicles):", TEXT_SEC, Font.PLAIN, 12), g);
-        g.gridy = 1; guessField = field();  c.add(guessField, g);
+        g.gridy = 0; c.add(label("Your guess (number of vehicles):", TEXT_SEC, Font.PLAIN, 12), g);
+        g.gridy = 1; guessField = field(); c.add(guessField, g);
         g.gridy = 2; c.add(label("Your bet  ($):", TEXT_SEC, Font.PLAIN, 12), g);
-        g.gridy = 3; betField   = field(); c.add(betField, g);
+        g.gridy = 3; betField   = field(); c.add(betField,   g);
 
         g.gridy  = 4;
         g.insets = new Insets(12, 0, 0, 0);
@@ -477,15 +704,14 @@ class GameWindow extends JFrame {
         return c;
     }
 
-    // ── Game logic ────────────────────────────────────────────────────────────
-
+    // Game logic 
     private void onStart() {
         int    guess;
         double bet;
 
         try {
             guess = Integer.parseInt(guessField.getText().trim());
-            if (guess < 0 || guess > 60) { err("Guess must be between 0 and 60."); return; }
+            if (guess < 0) { err("Guess must be 0 or higher."); return; }
         } catch (NumberFormatException ex) {
             err("Enter a whole number for your guess."); return;
         }
@@ -503,16 +729,25 @@ class GameWindow extends JFrame {
         pendingGuess = guess;
         pendingBet   = bet;
 
-        guessField .setEnabled(false);
-        betField   .setEnabled(false);
-        startBtn   .setEnabled(false);
+        guessField  .setEnabled(false);
+        betField    .setEnabled(false);
+        startBtn    .setEnabled(false);
         resultTitle .setText("—");
         resultTitle .setForeground(TEXT_SEC);
         resultDetail.setText("Detection running...");
         resultDetail.setForeground(TEXT_SEC);
         playAgainBtn.setVisible(false);
 
-        processor = new VideoProcessor(videoPanel, this::onCountUpdate, this::onFinished);
+        stopPreview();          // stop the preview loop before detection begins
+        videoPanel.clearVideoFrame();
+
+        // Priority: Python detection (accurate) → Simulation (fallback)
+        if (PYTHON_AVAILABLE) {
+            processor = new PythonVideoProcessor(videoPanel, this::onCountUpdate, this::onFinished);
+        } else {
+            processor = new SimulatedVideoProcessor(videoPanel, this::onCountUpdate, this::onFinished);
+        }
+
         processor.start();
     }
 
@@ -553,22 +788,23 @@ class GameWindow extends JFrame {
     }
 
     private void onNewRound() {
-        guessField .setEnabled(true);
-        betField   .setEnabled(true);
-        guessField .setText("");
-        betField   .setText("");
-        startBtn   .setEnabled(true);
+        guessField  .setEnabled(true);
+        betField    .setEnabled(true);
+        guessField  .setText("");
+        betField    .setText("");
+        startBtn    .setEnabled(true);
         resultTitle .setText("—");
         resultTitle .setForeground(TEXT_SEC);
         resultDetail.setText(" ");
         playAgainBtn.setVisible(false);
         liveCountLabel.setText("Detected:  0");
         videoPanel.setCount(0);
+        videoPanel.clearVideoFrame();
         videoPanel.repaint();
+        startPreview();         // resume video preview for next round
     }
 
-    // ── UI helpers ────────────────────────────────────────────────────────────
-
+    // UI helpers
     private JPanel card(String title) {
         JPanel p = new JPanel();
         p.setBackground(BG_CARD);
@@ -603,13 +839,13 @@ class GameWindow extends JFrame {
 
     private JButton btn(String text, Color bg) {
         JButton b = new JButton(text) {
-            @Override
-            protected void paintComponent(Graphics g) {
+            @Override protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                Color c = !isEnabled()            ? bg.darker().darker()  :
-                           getModel().isPressed() ? bg.darker()           :
-                           getModel().isRollover()? bg.brighter()         : bg;
+                Color c = !isEnabled()             ? bg.darker().darker()
+                         : getModel().isPressed()  ? bg.darker()
+                         : getModel().isRollover() ? bg.brighter()
+                                                   : bg;
                 g2.setColor(c);
                 g2.fillRoundRect(0, 0, getWidth(), getHeight(), 10, 10);
                 g2.setColor(isEnabled() ? Color.WHITE : new Color(180, 180, 180));
@@ -636,9 +872,7 @@ class GameWindow extends JFrame {
         JOptionPane.showMessageDialog(this, msg, "Input Error", JOptionPane.WARNING_MESSAGE);
     }
 
-    private static String fmt(double v) {
-        return String.format("%.2f", v);
-    }
+    private static String fmt(double v) { return String.format("%.2f", v); }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -654,7 +888,6 @@ public class Vehicle {
         if (name.trim().isEmpty()) name = "Player";
 
         Player player = new Player(name.trim(), 100.0);
-
         SwingUtilities.invokeLater(() -> new GameWindow(player).setVisible(true));
     }
 }
