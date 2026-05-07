@@ -403,10 +403,12 @@ class PythonVideoProcessor extends AbstractVideoProcessor {
         panel.setPythonStatus(STATUS);
 
         try {
-            ProcessBuilder pb = new ProcessBuilder("python", SCRIPT);
+            ProcessBuilder pb = new ProcessBuilder("py", SCRIPT);
             pb.directory(new File("."));
             pb.redirectErrorStream(false);   // keep stderr out of our count stream
             process = pb.start();
+
+            System.out.println("running");
 
             BufferedReader out = new BufferedReader(
                     new InputStreamReader(process.getInputStream()));
@@ -446,18 +448,39 @@ class PythonVideoProcessor extends AbstractVideoProcessor {
 
 class VideoPreviewThread extends Thread {
 
+     private String findPythonCommand() {
+        for (String cmd : new String[]{"py", "python", "python3"}) {
+            try {
+                Process p = new ProcessBuilder(cmd, "--version")
+                        .redirectErrorStream(true).start();
+                if (p.waitFor() == 0) return cmd;
+            } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
     // Inline Python: loop Video.mp4, encode each frame as JPEG, write to stdout
     private static final String SCRIPT =
         "import cv2,sys,struct,time\n" +
+        "sys.stderr.write('Starting preview...\\n')\n" +
+        "sys.stderr.flush()\n" +
         "cap=cv2.VideoCapture('Video.mp4')\n" +
+        "if not cap.isOpened():\n" +
+        " sys.stderr.write('ERROR: Cannot open stream\\n')\n" +
+        " sys.stderr.flush()\n" +
+        " sys.exit(1)\n" +
         "fps=cap.get(cv2.CAP_PROP_FPS)\n" +
         "if fps<=0 or fps>120: fps=25\n" +
         "delay=1.0/fps\n" +
+        "sys.stderr.write(f'Stream opened, fps={fps}\\n')\n" +
+        "sys.stderr.flush()\n" +
         "while True:\n" +
         " ret,frame=cap.read()\n" +
         " if not ret:\n" +
         "  cap.set(cv2.CAP_PROP_POS_FRAMES,0)\n" +
+        "  time.sleep(0.1)\n" +
         "  continue\n" +
+        " frame=cv2.resize(frame,(640,360))\n" +
         " ok,buf=cv2.imencode('.jpg',frame,[cv2.IMWRITE_JPEG_QUALITY,70])\n" +
         " if ok:\n" +
         "  data=buf.tobytes()\n" +
@@ -482,7 +505,13 @@ class VideoPreviewThread extends Thread {
     @Override
     public void run() {
         try {
-            process = new ProcessBuilder("python", "-c", SCRIPT)
+            String pythonCommand = findPythonCommand();
+            if (pythonCommand == null) {
+                System.err.println("[VideoPreview] No Python interpreter found!");
+                return;
+            }
+
+            process = new ProcessBuilder(pythonCommand, "-c", SCRIPT)
                     .redirectErrorStream(false)
                     .start();
 
@@ -505,16 +534,18 @@ class VideoPreviewThread extends Thread {
 
 class GameWindow extends JFrame {
 
+    // In the static block, also try "python" and "python3"
     private static final boolean PYTHON_AVAILABLE;
     static {
         boolean avail = false;
-        try {
-            if (new File("vehicle.py").exists()) {
-                Process p = new ProcessBuilder("python", "--version")
+        // Don't require vehicle.py for preview-only mode
+        for (String cmd : new String[]{"py", "python", "python3"}) {
+            try {
+                Process p = new ProcessBuilder(cmd, "--version")
                         .redirectErrorStream(true).start();
-                avail = (p.waitFor() == 0);
-            }
-        } catch (Throwable ignored) { }
+                if (p.waitFor() == 0) { avail = true; break; }
+            } catch (Throwable ignored) {}
+        }
         PYTHON_AVAILABLE = avail;
     }
 
