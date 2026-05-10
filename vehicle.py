@@ -8,38 +8,41 @@ from collections import deque
 
 cctvLinks = [
     "https://camera.jtd.co.id/camera/share/tios/2/27/index.m3u8",
-    "https://jmlive.jasamarga.com/hls/1/e1cba867-9601-4d46-bc83-138c204a74fe/index.m3u8",
-    "https://jmlive.jasamarga.com/hls/1/1f421ed3-78f5-4ade-8e20-031db3ba63cf/index.m3u8"
+    "https://cctv.kkdm.co.id/api/cctv/1/1/index.m3u8",
+    "https://jmlive.jasamarga.com/hls/2/05068266-1621-4265-8f95-2064804c1e88/index.m3u8"
 ]
 
-pickedLink = cctvLinks[random.randint(0, 2)]
+pickedLink = cctvLinks[2]
 cap = cv2.VideoCapture(pickedLink, cv2.CAP_FFMPEG)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
 cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
 cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
 
 DURATION = 10 
-BUFFER_SECONDS = 5 
+BUFFER_SECONDS = 5
 TARGET_FPS = 10
 
 if not cap.isOpened():
     print("Error: Could not open stream", file=sys.stderr)
-    print("FINAL:0", flush=True)
+    print("FINAL: 0", flush=True)
     exit()
 
 print("Successfully loaded video stream", file=sys.stderr)
 sys.stderr.flush()
 
-frame_buffer = deque(maxlen=TARGET_FPS * BUFFER_SECONDS) 
+frame_buffer = deque(maxlen=TARGET_FPS * 60) 
 grab_running = True
+frames_grabbed = 0
 
 
 def grab_frames():
     """Continuously grab frames into the buffer."""
+    global frames_grabbed
     while grab_running:
         ret, frame = cap.read()
         if ret:
             frame_buffer.append(frame)
+            frames_grabbed += 1
         else:
             time.sleep(0.01)
 
@@ -51,8 +54,9 @@ sys.stderr.flush()
 
 buffer_start = time.time()
 BUFFER_TIMEOUT = 20 
+min_buffer = TARGET_FPS * BUFFER_SECONDS
 
-while len(frame_buffer) < TARGET_FPS * BUFFER_SECONDS:
+while len(frame_buffer) < min_buffer:
     if time.time() - buffer_start > BUFFER_TIMEOUT:
         print("Buffer timeout — starting with partial buffer", file=sys.stderr)
         break
@@ -71,21 +75,35 @@ sys.stderr.flush()
 TARGET_W = 900
 TARGET_H = 520
 count_line_position = int(TARGET_H * 0.75)
-min_width_react = int(TARGET_W * 0.05)
-min_height_react = int(TARGET_H * 0.10)
-offset = 8
+min_width_react = int(TARGET_W * 0.04)
+min_height_react = int(TARGET_H * 0.08)
+offset = 15
 
-algo = cv2.bgsegm.createBackgroundSubtractorMOG()
+algo = cv2.createBackgroundSubtractorMOG2(history=500,
+    varThreshold=40,
+    detectShadows=True)
+algo.setShadowThreshold(0.5)
 
+ROI_MARGIN_X = int(TARGET_W * 0.03)
+ROI_MARGIN_TOP = int(TARGET_H * 0.10)
+ROI_MARGIN_BOTTOM = int(TARGET_H * 0.05) 
 
 def center_handle(x, y, w, h):
     return x + w // 2, y + h // 2
 
+def is_in_roi(x, y, w, h):
+    """Check if the detection is within the region of interest."""
+    cx, cy = x + w // 2, y + h // 2
+    if cx < ROI_MARGIN_X or cx > (TARGET_W - ROI_MARGIN_X):
+        return False
+    if cy < ROI_MARGIN_TOP or cy > (TARGET_H - ROI_MARGIN_BOTTOM):
+        return False
+    return True
 
 detect = []
 counter = 0
 frame_interval = 1.0 / TARGET_FPS
-
+frames_processed = 0
 start = time.time()
 
 while True:
@@ -102,25 +120,34 @@ while True:
         continue
 
     frame1 = frame_buffer.popleft()  # Process oldest (delayed) frame
+    frames_processed += 1
     frame1 = cv2.resize(frame1, (TARGET_W, TARGET_H))
 
     # ─── Background subtraction & detection ───────────────────
     grey = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(grey, (3, 3), 5)
+    blur = cv2.GaussianBlur(grey, (7, 7), 5)
     img_sub = algo.apply(blur)
-    dilat = cv2.dilate(img_sub, np.ones((5, 5)))
+    _, img_sub = cv2.threshold(img_sub, 200, 255, cv2.THRESH_BINARY)
+    img_sub = cv2.erode(img_sub, np.ones((2, 2)), iterations=1)
+
+    dilat = cv2.dilate(img_sub, np.ones((5, 5)), iterations=1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     dilatada = cv2.morphologyEx(dilat, cv2.MORPH_CLOSE, kernel)
     dilatada = cv2.morphologyEx(dilatada, cv2.MORPH_CLOSE, kernel)
 
-    counterShape, _ = cv2.findContours(dilatada, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    counterShape, _ = cv2.findContours(dilatada, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     cv2.line(frame1, (25, count_line_position),
              (TARGET_W - 25, count_line_position), (255, 127, 0), 3)
 
     for (_, c) in enumerate(counterShape):
         (x, y, w, h) = cv2.boundingRect(c)
+        if not is_in_roi(x, y, w, h):
+            continue
         if w < min_width_react or h < min_height_react:
+            continue
+        aspect_ratio = w / h
+        if aspect_ratio > 4.0 or aspect_ratio < 0.25:
             continue
         cv2.rectangle(frame1, (x, y), (x + w, y + h), (0, 255, 0), 2)
         label_y = max(y - 10, 20)
